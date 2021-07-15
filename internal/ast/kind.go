@@ -9,6 +9,8 @@ const (
 	Invalid Kind = iota
 	Comment
 	Key
+	Symbol
+	WhiteSpace
 
 	// top level structures
 	Table
@@ -36,6 +38,10 @@ func (k Kind) String() string {
 		return "Invalid"
 	case Comment:
 		return "Comment"
+	case Symbol:
+		return "Symbol"
+	case WhiteSpace:
+		return "WhiteSpace"
 	case Key:
 		return "Key"
 	case Table:

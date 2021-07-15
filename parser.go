@@ -8,6 +8,12 @@ import (
 	"github.com/pelletier/go-toml/v2/internal/danger"
 )
 
+type Decoration struct {
+	Before  []byte
+	After   []byte
+	Comment []byte
+}
+
 type parser struct {
 	builder ast.Builder
 	ref     ast.Reference
@@ -15,6 +21,9 @@ type parser struct {
 	left    []byte
 	err     error
 	first   bool
+
+	xast bool
+	decm map[ast.Reference]*Decoration
 }
 
 func (p *parser) Range(b []byte) ast.Range {
@@ -35,6 +44,9 @@ func (p *parser) Reset(b []byte) {
 	p.left = b
 	p.err = nil
 	p.first = true
+	if p.xast {
+		p.decm = make(map[ast.Reference]*Decoration)
+	}
 }
 
 //nolint:cyclop
@@ -100,19 +112,40 @@ func (p *parser) parseExpression(b []byte) (ast.Reference, []byte, error) {
 	// expression =/ ws table ws [ comment ]
 	ref := ast.InvalidReference
 
-	b = p.parseWhitespace(b)
+	ws, b := scanWhitespace(b)
 
 	if len(b) == 0 {
+		if p.xast && len(ws) > 0 {
+			ref = p.builder.Push(ast.Node{
+				Kind: ast.WhiteSpace,
+				Data: ws,
+			})
+		}
 		return ref, b, nil
 	}
 
 	if b[0] == '#' {
-		_, rest := scanComment(b)
+		com, rest := scanComment(b)
+		if p.xast {
+			ref = p.builder.Push(ast.Node{
+				Kind: ast.Comment,
+				Data: com,
+			})
+			if len(ws) > 0 {
+				p.decm[ref] = &Decoration{Before: ws}
+			}
+		}
 
 		return ref, rest, nil
 	}
 
 	if b[0] == '\n' || b[0] == '\r' {
+		if p.xast {
+			ref = p.builder.Push(ast.Node{
+				Kind: ast.WhiteSpace,
+				Data: ws,
+			})
+		}
 		return ref, b, nil
 	}
 
@@ -127,10 +160,23 @@ func (p *parser) parseExpression(b []byte) (ast.Reference, []byte, error) {
 		return ref, nil, err
 	}
 
-	b = p.parseWhitespace(b)
+	ws2, b := scanWhitespace(b)
+	if p.xast && (len(ws) > 0 || len(ws2) > 0) {
+		p.decm[ref] = &Decoration{
+			Before: ws,
+			After:  ws2,
+		}
+	}
 
 	if len(b) > 0 && b[0] == '#' {
-		_, rest := scanComment(b)
+		com, rest := scanComment(b)
+		if p.xast {
+			if v, ok := p.decm[ref]; ok {
+				v.Comment = com
+			} else {
+				p.decm[ref] = &Decoration{Comment: com}
+			}
+		}
 
 		return ref, rest, nil
 	}
@@ -154,6 +200,7 @@ func (p *parser) parseArrayTable(b []byte) (ast.Reference, []byte, error) {
 	ref := p.builder.Push(ast.Node{
 		Kind: ast.ArrayTable,
 	})
+	start := uint32(danger.SubsliceOffset(p.data, b))
 
 	b = b[2:]
 	b = p.parseWhitespace(b)
@@ -173,6 +220,13 @@ func (p *parser) parseArrayTable(b []byte) (ast.Reference, []byte, error) {
 
 	b, err = expect(']', b)
 
+	if p.xast && err == nil {
+		p.builder.NodeAt(ref).Raw = ast.Range{
+			Offset: start,
+			Length: uint32(danger.SubsliceOffset(p.data, b)) - start,
+		}
+	}
+
 	return ref, b, err
 }
 
@@ -183,6 +237,7 @@ func (p *parser) parseStdTable(b []byte) (ast.Reference, []byte, error) {
 	ref := p.builder.Push(ast.Node{
 		Kind: ast.Table,
 	})
+	start := uint32(danger.SubsliceOffset(p.data, b))
 
 	b = b[1:]
 	b = p.parseWhitespace(b)
@@ -197,6 +252,13 @@ func (p *parser) parseStdTable(b []byte) (ast.Reference, []byte, error) {
 	b = p.parseWhitespace(b)
 
 	b, err = expect(']', b)
+
+	if p.xast && err == nil {
+		p.builder.NodeAt(ref).Raw = ast.Range{
+			Offset: start,
+			Length: uint32(danger.SubsliceOffset(p.data, b)) - start,
+		}
+	}
 
 	return ref, b, err
 }
@@ -214,18 +276,33 @@ func (p *parser) parseKeyval(b []byte) (ast.Reference, []byte, error) {
 
 	// keyval-sep = ws %x3D ws ; =
 
-	b = p.parseWhitespace(b)
+	ws, b := scanWhitespace(b)
 
 	if len(b) == 0 {
 		return ast.InvalidReference, nil, newDecodeError(b, "expected = after a key, but the document ends there")
 	}
 
+	equal := b[:1]
 	b, err = expect('=', b)
 	if err != nil {
 		return ast.InvalidReference, nil, err
 	}
 
-	b = p.parseWhitespace(b)
+	ws2, b := scanWhitespace(b)
+
+	if p.xast {
+		sym := p.builder.Push(ast.Node{
+			Kind: ast.Symbol,
+			Data: equal,
+		})
+		p.builder.AttachChild(key, sym)
+		if len(ws) > 0 || len(ws2) > 0 {
+			p.decm[sym] = &Decoration{
+				Before: ws,
+				After:  ws2,
+			}
+		}
+	}
 
 	valRef, b, err := p.parseVal(b)
 	if err != nil {
@@ -344,6 +421,7 @@ func (p *parser) parseInlineTable(b []byte) (ast.Reference, []byte, error) {
 	parent := p.builder.Push(ast.Node{
 		Kind: ast.InlineTable,
 	})
+	start := uint32(danger.SubsliceOffset(p.data, b))
 
 	first := true
 
@@ -354,17 +432,36 @@ func (p *parser) parseInlineTable(b []byte) (ast.Reference, []byte, error) {
 	var err error
 
 	for len(b) > 0 {
-		b = p.parseWhitespace(b)
+		var ws []byte
+		ws, b = scanWhitespace(b)
 		if b[0] == '}' {
 			break
 		}
 
 		if !first {
+			comma := b[:1]
 			b, err = expect(',', b)
 			if err != nil {
 				return parent, nil, err
 			}
-			b = p.parseWhitespace(b)
+			var ws2 []byte
+			ws2, b = scanWhitespace(b)
+
+			if p.xast {
+				sym := p.builder.Push(ast.Node{
+					Kind: ast.Symbol,
+					Data: comma,
+				})
+				p.builder.Chain(child, sym)
+				child = sym
+
+				if len(ws) > 0 || len(ws2) > 0 {
+					p.decm[sym] = &Decoration{
+						Before: ws,
+						After:  ws2,
+					}
+				}
+			}
 		}
 
 		var kv ast.Reference
@@ -386,6 +483,13 @@ func (p *parser) parseInlineTable(b []byte) (ast.Reference, []byte, error) {
 
 	rest, err := expect('}', b)
 
+	if p.xast && err == nil {
+		p.builder.NodeAt(parent).Raw = ast.Range{
+			Offset: start,
+			Length: uint32(danger.SubsliceOffset(p.data, rest)) - start,
+		}
+	}
+
 	return parent, rest, err
 }
 
@@ -398,6 +502,7 @@ func (p *parser) parseValArray(b []byte) (ast.Reference, []byte, error) {
 	// array-values =/ ws-comment-newline val ws-comment-newline [ array-sep ]
 	// array-sep = %x2C  ; , Comma
 	// ws-comment-newline = *( wschar / [ comment ] newline )
+	start := uint32(danger.SubsliceOffset(p.data, b))
 	b = b[1:]
 
 	parent := p.builder.Push(ast.Node{
@@ -405,12 +510,16 @@ func (p *parser) parseValArray(b []byte) (ast.Reference, []byte, error) {
 	})
 
 	first := true
+	firstChild := true
+	prevVal := false
 
 	var lastChild ast.Reference
 
 	var err error
 	for len(b) > 0 {
-		b, err = p.parseOptionalWhitespaceCommentNewline(b)
+		var ws []byte
+		b, ws, err = p.parseOptionalWhitespaceCommentNewline(b, parent, &firstChild, &lastChild, prevVal)
+		prevVal = false
 		if err != nil {
 			return parent, nil, err
 		}
@@ -427,9 +536,28 @@ func (p *parser) parseValArray(b []byte) (ast.Reference, []byte, error) {
 			if first {
 				return parent, nil, newDecodeError(b[0:1], "array cannot start with comma")
 			}
+
+			if p.xast {
+				ref := p.builder.Push(ast.Node{
+					Kind: ast.Symbol,
+					Data: b[:1],
+				})
+				if len(ws) > 0 {
+					p.decm[ref] = &Decoration{Before: ws}
+				}
+
+				if firstChild {
+					firstChild = false
+					p.builder.AttachChild(parent, ref)
+				} else {
+					p.builder.Chain(lastChild, ref)
+				}
+				lastChild = ref
+			}
+
 			b = b[1:]
 
-			b, err = p.parseOptionalWhitespaceCommentNewline(b)
+			b, ws, err = p.parseOptionalWhitespaceCommentNewline(b, parent, &firstChild, &lastChild, true)
 			if err != nil {
 				return parent, nil, err
 			}
@@ -447,32 +575,47 @@ func (p *parser) parseValArray(b []byte) (ast.Reference, []byte, error) {
 			return parent, nil, err
 		}
 
-		if first {
+		if p.xast && len(ws) > 0 {
+			p.decm[valueRef] = &Decoration{Before: ws}
+		}
+
+		if firstChild {
 			p.builder.AttachChild(parent, valueRef)
 		} else {
 			p.builder.Chain(lastChild, valueRef)
 		}
 		lastChild = valueRef
+		firstChild = false
 
-		b, err = p.parseOptionalWhitespaceCommentNewline(b)
-		if err != nil {
-			return parent, nil, err
-		}
+		// b, err = p.parseOptionalWhitespaceCommentNewline(b)
+		// if err != nil {
+		// 	return parent, nil, err
+		// }
+		prevVal = true
 		first = false
 	}
 
 	rest, err := expect(']', b)
 
+	if p.xast && err == nil {
+		p.builder.NodeAt(parent).Raw = ast.Range{
+			Offset: start,
+			Length: uint32(danger.SubsliceOffset(p.data, rest)) - start,
+		}
+	}
+
 	return parent, rest, err
 }
 
-func (p *parser) parseOptionalWhitespaceCommentNewline(b []byte) ([]byte, error) {
+func (p *parser) parseOptionalWhitespaceCommentNewline(b []byte, parent ast.Reference, first *bool, lastChild *ast.Reference, after bool) ([]byte, []byte, error) {
+	var ws []byte
 	for len(b) > 0 {
 		var err error
-		b = p.parseWhitespace(b)
+		ws, b = scanWhitespace(b)
 
+		var com []byte
 		if len(b) > 0 && b[0] == '#' {
-			_, b = scanComment(b)
+			com, b = scanComment(b)
 		}
 
 		if len(b) == 0 {
@@ -482,14 +625,58 @@ func (p *parser) parseOptionalWhitespaceCommentNewline(b []byte) ([]byte, error)
 		if b[0] == '\n' || b[0] == '\r' {
 			b, err = p.parseNewline(b)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
+
+			if p.xast {
+				if after {
+					after = false
+
+					if len(ws) > 0 || len(com) > 0 {
+						if v, ok := p.decm[*lastChild]; ok {
+							v.After = ws
+							v.Comment = com
+						} else {
+							p.decm[*lastChild] = &Decoration{
+								After:   ws,
+								Comment: com,
+							}
+						}
+					}
+				} else {
+					var ref ast.Reference
+					if len(com) > 0 {
+						ref = p.builder.Push(ast.Node{
+							Kind: ast.Comment,
+							Data: com,
+						})
+						if len(ws) > 0 {
+							p.decm[ref] = &Decoration{Before: ws}
+						}
+					} else {
+						ref = p.builder.Push(ast.Node{
+							Kind: ast.WhiteSpace,
+							Data: ws,
+						})
+					}
+
+					if *first {
+						*first = false
+						p.builder.AttachChild(parent, ref)
+					} else {
+						p.builder.Chain(*lastChild, ref)
+					}
+					*lastChild = ref
+				}
+			}
+
+			ws = nil
 		} else {
 			break
 		}
 	}
 
-	return b, nil
+	return b, ws, nil
 }
 
 func (p *parser) parseMultilineLiteralString(b []byte) ([]byte, []byte, []byte, error) {
@@ -638,22 +825,43 @@ func (p *parser) parseKey(b []byte) (ast.Reference, []byte, error) {
 		Raw:  p.Range(raw),
 		Data: key,
 	})
+	lastRef := ref
 
 	for {
-		b = p.parseWhitespace(b)
+		var ws []byte
+		ws, b = scanWhitespace(b)
 		if len(b) > 0 && b[0] == '.' {
-			b = p.parseWhitespace(b[1:])
+			dot := b[:1]
+			var ws2 []byte
+			ws2, b = scanWhitespace(b[1:])
 
 			raw, key, b, err = p.parseSimpleKey(b)
 			if err != nil {
 				return ref, nil, err
 			}
 
-			p.builder.PushAndChain(ast.Node{
+			reft := p.builder.Push(ast.Node{
 				Kind: ast.Key,
 				Raw:  p.Range(raw),
 				Data: key,
 			})
+			p.builder.Chain(lastRef, reft)
+			lastRef = reft
+
+			if p.xast {
+				sym := p.builder.Push(ast.Node{
+					Kind: ast.Symbol,
+					Data: dot,
+				})
+				p.builder.AttachChild(lastRef, sym)
+
+				if len(ws) > 0 || len(ws2) > 0 {
+					p.decm[sym] = &Decoration{
+						Before: ws,
+						After:  ws2,
+					}
+				}
+			}
 		} else {
 			break
 		}
